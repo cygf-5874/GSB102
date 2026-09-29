@@ -4,7 +4,10 @@
 // 只认识自己写出去的几个已知字段。
 package tlvkeep
 
-import "errors"
+import (
+	"errors"
+	"sort"
+)
 
 // 本包所有失败路径都返回下面四个哨兵错误之一（或其包装）。
 // 调用方用 errors.Is 判定，不要比较错误字符串。
@@ -50,21 +53,61 @@ func Decode(b []byte) (*Message, error) {
 
 // Encode 把一条 Message 编成 TLV 字节流。
 func Encode(m *Message) ([]byte, error) {
+	return encode(m, 1)
+}
+
+func encode(m *Message, depth int) ([]byte, error) {
 	out := []byte{}
 	if m == nil {
 		return out, nil
 	}
+
+	type segment struct {
+		tag uint64
+		raw []byte
+	}
+
+	segments := make([]segment, 0, 4+len(m.Tags)+len(m.Unknown))
+	add := func(tag uint64, raw []byte) {
+		segments = append(segments, segment{tag: tag, raw: raw})
+	}
+
 	if m.Name != "" {
-		out = append(out, makeSeg(1, []byte(m.Name))...)
+		add(1, makeSeg(1, []byte(m.Name)))
 	}
 	if m.Age != 0 {
-		out = append(out, makeSeg(2, putVarint(m.Age))...)
+		add(2, makeSeg(2, putVarint(m.Age)))
 	}
 	if m.Email != "" {
-		out = append(out, makeSeg(3, []byte(m.Email))...)
+		add(3, makeSeg(3, []byte(m.Email)))
 	}
 	for _, t := range m.Tags {
-		out = append(out, makeSeg(4, []byte(t))...)
+		add(4, makeSeg(4, []byte(t)))
+	}
+	if m.Nested != nil {
+		if depth >= maxDepth {
+			return nil, ErrDepth
+		}
+		nested, err := encode(m.Nested, depth+1)
+		if err != nil {
+			return nil, err
+		}
+		add(5, makeSeg(5, nested))
+	}
+	for _, raw := range m.Unknown {
+		tag, _, ok := readVarint(raw)
+		if !ok {
+			return nil, ErrTruncated
+		}
+		add(tag, raw)
+	}
+
+	sort.SliceStable(segments, func(i, j int) bool {
+		return segments[i].tag < segments[j].tag
+	})
+
+	for _, segment := range segments {
+		out = append(out, segment.raw...)
 	}
 	return out, nil
 }
@@ -80,6 +123,8 @@ func decode(b []byte, depth int, requireName bool) (*Message, error) {
 	hasPrev := false
 
 	for pos < len(b) {
+		segStart := pos
+
 		tag, n, ok := readVarint(b[pos:])
 		if !ok {
 			return nil, ErrTruncated
@@ -121,8 +166,17 @@ func decode(b []byte, depth int, requireName bool) (*Message, error) {
 			m.Email = string(val)
 		case 4:
 			m.Tags = append(m.Tags, string(val))
+		case 5:
+			if depth >= maxDepth {
+				return nil, ErrDepth
+			}
+			nested, err := decode(val, depth+1, false)
+			if err != nil {
+				return nil, err
+			}
+			m.Nested = nested
 		default:
-			// 未知 Tag：跳过。
+			m.Unknown = append(m.Unknown, append([]byte(nil), b[segStart:pos]...))
 		}
 	}
 
