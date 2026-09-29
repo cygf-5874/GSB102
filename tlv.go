@@ -54,17 +54,51 @@ func Encode(m *Message) ([]byte, error) {
 	if m == nil {
 		return out, nil
 	}
+
+	unknownAt := 0
+	emitUnknownBefore := func(tag uint64) {
+		for unknownAt < len(m.Unknown) {
+			raw := m.Unknown[unknownAt]
+			unknownTag, _, ok := readVarint(raw)
+			if !ok || unknownTag >= tag {
+				break
+			}
+			out = append(out, raw...)
+			unknownAt++
+		}
+	}
+
+	emitUnknownBefore(1)
 	if m.Name != "" {
 		out = append(out, makeSeg(1, []byte(m.Name))...)
 	}
+
+	emitUnknownBefore(2)
 	if m.Age != 0 {
 		out = append(out, makeSeg(2, putVarint(m.Age))...)
 	}
+
+	emitUnknownBefore(3)
 	if m.Email != "" {
 		out = append(out, makeSeg(3, []byte(m.Email))...)
 	}
+
+	emitUnknownBefore(4)
 	for _, t := range m.Tags {
 		out = append(out, makeSeg(4, []byte(t))...)
+	}
+
+	emitUnknownBefore(5)
+	if m.Nested != nil {
+		nested, err := Encode(m.Nested)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, makeSeg(5, nested)...)
+	}
+
+	for ; unknownAt < len(m.Unknown); unknownAt++ {
+		out = append(out, m.Unknown[unknownAt]...)
 	}
 	return out, nil
 }
@@ -80,6 +114,8 @@ func decode(b []byte, depth int, requireName bool) (*Message, error) {
 	hasPrev := false
 
 	for pos < len(b) {
+		segStart := pos
+
 		tag, n, ok := readVarint(b[pos:])
 		if !ok {
 			return nil, ErrTruncated
@@ -121,8 +157,17 @@ func decode(b []byte, depth int, requireName bool) (*Message, error) {
 			m.Email = string(val)
 		case 4:
 			m.Tags = append(m.Tags, string(val))
+		case 5:
+			if depth >= maxDepth {
+				return nil, ErrDepth
+			}
+			nested, err := decode(val, depth+1, false)
+			if err != nil {
+				return nil, err
+			}
+			m.Nested = nested
 		default:
-			// 未知 Tag：跳过。
+			m.Unknown = append(m.Unknown, append([]byte(nil), b[segStart:pos]...))
 		}
 	}
 
